@@ -1,0 +1,266 @@
+---
+title: "Supplementary file 4"
+author: "Orsolya Pipek (ELTE)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: "show"
+    toc: true
+    toc_float: true
+    df_print: paged
+    theme: paper
+    fig_width: 6
+    fig_height: 4.5
+    toc_depth: 5
+    number_sections: true
+---
+
+```{r setup}
+knitr::opts_chunk$set(warning=FALSE)
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+```{css, echo=FALSE}
+pre {
+  max-height: 300px;
+  overflow-y: auto;
+}
+```
+
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 10px; padding: 10px;}
+div.orange { background-color:#fff6e6; border-radius: 10px; padding: 10px;}
+</style>
+
+# An example pipeline for estimating DNAm age with different models for arbitrary methylation data
+
+## Loading necessary R packages
+
+For the tutorial below, we are going to use the following R packages:
+
+- [`dplyr`](https://dplyr.tidyverse.org/) for dataframe manipulation
+- [`ggplot2`](https://ggplot2.tidyverse.org/) and [`ggpubr`](https://rpkgs.datanovia.com/ggpubr/) for plotting
+- [`GEOquery`](https://www.bioconductor.org/packages/release/bioc/html/GEOquery.html) for handling data stored on [NCBI's Gene Expression Omnibus (GEO)](https://www.ncbi.nlm.nih.gov/geo/)
+- [`readr`](https://readr.tidyverse.org/) for loading large dataframes
+
+```{r message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(GEOquery)
+library(readr)
+```
+
+
+## Loading model parameters
+
+Model parameters are stored in Supplementary file 3, but can also be loaded from the following github URL:
+
+`https://raw.githubusercontent.com/pipekorsi/MepiClock/main/resources/model_coefficients.csv`
+
+```{r}
+df_model_coeff <- read.csv("https://raw.githubusercontent.com/pipekorsi/MepiClock/main/resources/model_coefficients.csv", sep=";", stringsAsFactors = FALSE, check.names = FALSE)
+```
+
+The first few raws of the dataframe show its basic structure. Coefficient values equal to zero represent CpG probes not included in the covariates of the given model.
+
+```{r}
+df_model_coeff %>% head()
+```
+
+## Loading methylation dataset
+
+### Checking metadata
+
+In this tutorial we are going to use one of the methylation datasets included in the test data used for accessing model performance. Its GEO accession number is `GSE152026` and in the following we are going to use the GEOquery package to collect relevant information about the study.
+
+```{r, message=FALSE}
+gse <- getGEO("GSE152026")
+```
+
+We can check the details of the study with the following code:
+
+```{r}
+gse[["GSE152026_series_matrix.txt.gz"]]@experimentData@title
+gse[["GSE152026_series_matrix.txt.gz"]]@experimentData@abstract
+```
+
+The samples in this dataset are either from patients suffering from schizophrenia or control cases. In our analysis, only the control cases will be needed. We will also need the chronological age of the patients to be able to test model performance. Here we extract age and sample name for control cases and store them in a dataframe:
+
+```{r}
+keep_samples_idx <- grepl("Control", gse[["GSE152026_series_matrix.txt.gz"]][["characteristics_ch1"]], fixed = TRUE)
+
+cc <- strsplit(as.character(gse[["GSE152026_series_matrix.txt.gz"]][["characteristics_ch1.2"]]), ': ', fixed = TRUE)
+age <- as.numeric(unlist(cc)[2*(1:length(as.character(gse[["GSE152026_series_matrix.txt.gz"]][["characteristics_ch1.2"]])))])
+
+cc <- strsplit(as.character(gse[["GSE152026_series_matrix.txt.gz"]][["title"]]), ' ', fixed = TRUE)
+sample_names <- unlist(cc)[2*(1:length(as.character(gse[["GSE152026_series_matrix.txt.gz"]][["title"]])))-1]
+
+sample_metadata_df <- data.frame(sampleName = sample_names[keep_samples_idx],
+                                 age = age[keep_samples_idx], stringsAsFactors = FALSE)
+
+sample_metadata_df %>% head()
+```
+
+The number of remaining samples:
+
+```{r}
+dim(sample_metadata_df)[1]
+```
+
+
+### Downloading raw methylation data
+
+Apparently, the Illumina Infinium HumanMethylationEPIC BeadChip was used to generate methylation data, thus we expect to have around 850K measurement points for each sample. Unfortunately, there is no "Series Matrix" available on GEO for this dataset, which usually containes the relevant data in a concise manner, thus the raw data needs to be downloaded and preprocessed.
+
+We downloaded the `GSE152026_EUGEI_processed_signals.csv.gz` file from the GEO ftp site on a Linux system with: 
+
+`wget https://ftp.ncbi.nlm.nih.gov/geo/series/GSE152nnn/GSE152026/suppl/GSE152026_EUGEI_processed_signals.csv.gz`
+
+Checking the first few rows and columns of the downloaded datafile reveals that both the $\beta$-values and the detection p-values are recorded and samples are referred to by their sentrix position and chip ID:
+
+```{r}
+as.character(system("zcat data/GSE152026/GSE152026_EUGEI_processed_signals.csv.gz | head -2 | cut -d',' -f1,2,3,4,5"))
+```
+
+Checking the number of lines is in agreement with our previous knowledge that the samples were processed on the EPIC array:
+
+```{r}
+system("zcat data/GSE152026/GSE152026_EUGEI_processed_signals.csv.gz | wc -l")
+```
+
+
+Given that the epigenetic clock models only contain a couple hundred CpG sites, it is computationally more efficient to only load a dataset that was previously filtered for these probes and sample columns:
+
+```{r message=FALSE}
+probes_to_keep <- df_model_coeff$probeID[df_model_coeff$probeID != "(Intercept)"]
+samples_to_keep <- sample_metadata_df$sampleName
+
+f <- function(x, pos) x %>% select(c("X1", all_of(samples_to_keep))) %>% mutate(probeID = X1) %>% filter(probeID %in% probes_to_keep) %>% select(-X1)
+beta_df <- read_csv_chunked("data/GSE152026/GSE152026_EUGEI_processed_signals.csv.gz", 
+                 DataFrameCallback$new(f), 
+                 chunk_size = 10000,
+                 quote = "\"",
+                 progress = TRUE
+                 )
+
+beta_df <- as.data.frame(beta_df)
+rownames(beta_df) <- beta_df$probeID
+beta_df <- beta_df %>% select(all_of(samples_to_keep))
+```
+
+The loaded dataframe now contains methylation $\beta$-values for the 521 samples in the dataset for the relevant CpG probes included in the epigenetic clock models:
+
+```{r}
+beta_df %>% head()
+```
+
+## Predicting chronological age
+
+Chronological age can be predicted with either of the four models found in the `model_coefficients.csv` file as the appropriate linear combination of methylation values plus the intercept. More precisely, a transformation of the chronological age is predicted by the models which needs to be transformed back to the original scale with the function below:
+
+```{r}
+transform_prediction <- function(pred, age_adult=20){
+  ifelse(pred<0, (1+age_adult)*exp(pred)-1, (1+age_adult)*pred+age_adult)
+}
+```
+
+Here we perform the actual age predictions and append them to the metadata table for easier plotting:
+
+```{r}
+# prediction with "elasticNet (239)" model
+probes_to_use <- df_model_coeff$probeID[df_model_coeff$probeID %in% rownames(beta_df)]
+coeffs_to_use <- (df_model_coeff %>% filter(probeID %in% probes_to_use))$`elasticNet (239)`
+
+meth_values_for_agepred <- beta_df[probes_to_use,]
+predage <- transform_prediction(df_model_coeff$`elasticNet (239)`[1] + t(as.matrix(meth_values_for_agepred)) %*% coeffs_to_use)
+
+sample_metadata_df <- sample_metadata_df %>% mutate(predicted_age_elasticNet = predage[sampleName,])
+
+# prediction with "filtered H (272)" model
+probes_to_use <- df_model_coeff$probeID[df_model_coeff$probeID %in% rownames(beta_df)]
+coeffs_to_use <- (df_model_coeff %>% filter(probeID %in% probes_to_use))$`filtered H (272)`
+
+meth_values_for_agepred <- beta_df[probes_to_use,]
+predage <- transform_prediction(df_model_coeff$`filtered H (272)`[1] + t(as.matrix(meth_values_for_agepred)) %*% coeffs_to_use)
+
+sample_metadata_df <- sample_metadata_df %>% mutate(predicted_age_filteredH = predage[sampleName,])
+
+# prediction with "retrained H (308)" model
+probes_to_use <- df_model_coeff$probeID[df_model_coeff$probeID %in% rownames(beta_df)]
+coeffs_to_use <- (df_model_coeff %>% filter(probeID %in% probes_to_use))$`retrained H (308)`
+
+meth_values_for_agepred <- beta_df[probes_to_use,]
+predage <- transform_prediction(df_model_coeff$`retrained H (308)`[1] + t(as.matrix(meth_values_for_agepred)) %*% coeffs_to_use)
+
+sample_metadata_df <- sample_metadata_df %>% mutate(predicted_age_retrainedH = predage[sampleName,])
+
+# prediction with "original H (336)" model
+probes_to_use <- df_model_coeff$probeID[df_model_coeff$probeID %in% rownames(beta_df)]
+coeffs_to_use <- (df_model_coeff %>% filter(probeID %in% probes_to_use))$`original H (336)`
+
+meth_values_for_agepred <- beta_df[probes_to_use,]
+predage <- transform_prediction(df_model_coeff$`original H (336)`[1] + t(as.matrix(meth_values_for_agepred)) %*% coeffs_to_use)
+
+sample_metadata_df <- sample_metadata_df %>% mutate(predicted_age_originalH = predage[sampleName,])
+```
+
+And finally plot the results:
+
+```{r fig.width=10, fig.height=10}
+r <- round(cor(sample_metadata_df$age, sample_metadata_df$predicted_age_elasticNet, use = "complete.obs"),2)
+mae <- round(median(abs(sample_metadata_df$age-sample_metadata_df$predicted_age_elasticNet), na.rm = TRUE),2)
+
+
+f_elasticnet <- ggplot(data = sample_metadata_df) +
+  geom_abline(intercept = 0, slope = 1, color="black", size=1)+
+  geom_point(size = 3, alpha = 0.5, aes(x=age, y=predicted_age_elasticNet), color="#023047") + 
+  labs(x="chronological age (years)", y= "predicted DNA methylation age (years)", title="elasticNet (239)")+
+  theme_minimal()+
+  xlim(10,70)+
+  ylim(10,70)+
+  annotate(geom="text", x=20, y=60, label=paste0("r = ", r, "\nMAE = ", mae, " years"), color="black", hjust=0)
+
+r <- round(cor(sample_metadata_df$age, sample_metadata_df$predicted_age_filteredH, use = "complete.obs"),2)
+mae <- round(median(abs(sample_metadata_df$age-sample_metadata_df$predicted_age_filteredH), na.rm = TRUE),2)
+
+
+f_filteredH <- ggplot(data = sample_metadata_df) +
+  geom_abline(intercept = 0, slope = 1, color="black", size=1)+
+  geom_point(size = 3, alpha = 0.5, aes(x=age, y=predicted_age_filteredH), color="#219ebc") + 
+  labs(x="chronological age (years)", y= "predicted DNA methylation age (years)", title="filtered H (272)")+
+  theme_minimal()+
+  xlim(10,70)+
+  ylim(10,70)+
+  annotate(geom="text", x=20, y=60, label=paste0("r = ", r, "\nMAE = ", mae, " years"), color="black", hjust=0)
+
+r <- round(cor(sample_metadata_df$age, sample_metadata_df$predicted_age_retrainedH, use = "complete.obs"),2)
+mae <- round(median(abs(sample_metadata_df$age-sample_metadata_df$predicted_age_retrainedH), na.rm = TRUE),2)
+
+
+f_retrainedH <- ggplot(data = sample_metadata_df) +
+  geom_abline(intercept = 0, slope = 1, color="black", size=1)+
+  geom_point(size = 3, alpha = 0.5, aes(x=age, y=predicted_age_retrainedH), color="#8ecae6") + 
+  labs(x="chronological age (years)", y= "predicted DNA methylation age (years)", title="retrained H (308)")+
+  theme_minimal()+
+  xlim(10,70)+
+  ylim(10,70)+
+  annotate(geom="text", x=20, y=60, label=paste0("r = ", r, "\nMAE = ", mae, " years"), color="black", hjust=0)
+
+r <- round(cor(sample_metadata_df$age, sample_metadata_df$predicted_age_originalH, use = "complete.obs"),2)
+mae <- round(median(abs(sample_metadata_df$age-sample_metadata_df$predicted_age_originalH), na.rm = TRUE),2)
+
+f_originalH <- ggplot(data = sample_metadata_df) +
+  geom_abline(intercept = 0, slope = 1, color="black", size=1)+
+  geom_point(size = 3, alpha = 0.5, aes(x=age, y=predicted_age_originalH), color="#ffb703") + 
+  labs(x="chronological age (years)", y= "predicted DNA methylation age (years)", title="original H (336)")+
+  theme_minimal()+
+  xlim(10,70)+
+  ylim(10,70)+
+  annotate(geom="text", x=20, y=60, label=paste0("r = ", r, "\nMAE = ", mae, " years"), color="black", hjust=0)
+
+
+ggarrange(f_elasticnet, f_filteredH, f_retrainedH, f_originalH, nrow = 2, ncol = 2)
+```
+
+
